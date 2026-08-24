@@ -1,0 +1,9 @@
+# Normalise line endings so a Windows checkout does not show every file as
+# changed the moment someone on macOS or Linux touches it.
+* text=auto eol=lf
+
+# Binary: never touch these.
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary

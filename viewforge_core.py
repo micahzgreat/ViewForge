@@ -8,8 +8,16 @@ Two ways to define a view:
 
   source='box'        You draw the rectangle, and the rectangle IS the
                       measurement: its edges sit on the object's extremes. Ink
-                      outside is clipped. Use this on sheets where dimension
+                      outside is clipped. Use this on blueprints where dimension
                       lines join the views together, which defeats auto detect.
+
+Either kind can carry MEASURE LINES: a pair of guides on the horizontal axis,
+the vertical axis, or both. Without them the view's own span is what your stated
+dimension refers to. With them the dimension is taken between the two lines
+instead, which is how you handle a drawing whose figure is measured between two
+points that are not the object's extremes - a shoulder, a bore centre, a face
+set back from the silhouette. The rendered plane still shows the whole view; only
+the scale changes.
 """
 
 from __future__ import annotations
@@ -19,7 +27,8 @@ from PIL import Image
 from scipy import ndimage
 
 # Each view shows two of the object's three dimensions: 'h' is the image's
-# horizontal axis, 'v' the vertical. L=length, W=width, H=height.
+# horizontal axis, 'v' the vertical. L=length, W=width, H=height. This is the
+# mapping for a view drawn the right way up; see view_axes() for the rest.
 ROLE_AXES = {
     "side":   ("L", "H"),
     "top":    ("L", "W"),
@@ -29,27 +38,58 @@ ROLE_AXES = {
 }
 ROLES = ["ignore"] + list(ROLE_AXES)
 
+# Roles where 'front of object is at' is a real question. On front and back the
+# object's front faces the viewer, so the answer is neither left nor right and
+# the control is not offered; those views are stored as 'n/a'.
+FACING_ROLES = ("side", "top", "bottom")
+FACINGS = ["left", "right", "up", "down"]
+
 # Blender placement. Convention: length on Y with the object's FRONT at -Y,
 # width on X, height on Z, bounding box centred on the world origin.
-# 'facing' = which edge of the image the object's front sits against.
+# 'facing' = which edge of the image the object's front sits against. 'up' and
+# 'down' are views drawn a quarter turn round, which also swaps which of the
+# object's dimensions runs across the image - that part is view_axes()'s job.
 BLENDER = {
     ("side",   "left"):  dict(rot=(90, 0,  90), normal="+X", key="Numpad 3"),
     ("side",   "right"): dict(rot=(90, 0, -90), normal="-X", key="Ctrl+Numpad 3"),
+    ("side",   "up"):    dict(rot=(0, -90, 180), normal="+X", key="Numpad 3"),
+    ("side",   "down"):  dict(rot=(0,  90,  0), normal="+X", key="Numpad 3"),
     ("top",    "left"):  dict(rot=(0,  0,  90), normal="+Z", key="Numpad 7"),
     ("top",    "right"): dict(rot=(0,  0, -90), normal="+Z", key="Numpad 7"),
+    ("top",    "up"):    dict(rot=(0,  0, 180), normal="+Z", key="Numpad 7"),
+    ("top",    "down"):  dict(rot=(0,  0,   0), normal="+Z", key="Numpad 7"),
     ("bottom", "left"):  dict(rot=(180, 0, 90), normal="-Z", key="Ctrl+Numpad 7"),
     ("bottom", "right"): dict(rot=(180, 0, -90), normal="-Z", key="Ctrl+Numpad 7"),
+    ("bottom", "up"):    dict(rot=(180, 0,  0), normal="-Z", key="Ctrl+Numpad 7"),
+    ("bottom", "down"):  dict(rot=(180, 0, 180), normal="-Z", key="Ctrl+Numpad 7"),
     ("front",  "n/a"):   dict(rot=(90, 0,   0), normal="-Y", key="Numpad 1"),
     ("back",   "n/a"):   dict(rot=(90, 0, 180), normal="+Y", key="Ctrl+Numpad 1"),
 }
+
+MARGIN = 1.06            # canvas multiplier. Not a knob any more: it is small
+                         # enough not to waste resolution and the canvas grows
+                         # on its own whenever a view would otherwise be cut off.
+
+# Output resolution is worked out from the drawing instead of being typed in.
+# 'normal' keeps roughly one output pixel per source pixel, which is the most a
+# blueprint can actually justify; the canvas is then held inside these bounds so
+# a big blueprint cannot produce a 20000 px plane and a tiny object cannot make a
+# 60 px one.
+DETAIL = {"draft": 0.5, "normal": 1.0, "fine": 2.0}
+CANVAS_MAX_PX = 6000
+CANVAS_MIN_PX = 500
+
+# In proportional mode nothing is measured in the real world: the drawing's own
+# proportions are kept and the object is sized so its largest side is this.
+PROPORTIONAL_MM = 1000.0
 
 
 class SolveError(ValueError):
     """Something the user can fix. The message says how."""
 
 
-# Sheet i/o and auto-detect
-def load_sheet(path, threshold=None):
+# Blueprint i/o and auto-detect
+def load_blueprint(path, threshold=None):
     g = np.asarray(Image.open(path).convert("L")).astype(np.int16)
     if threshold is None:
         paper = np.percentile(g, 90)
@@ -59,9 +99,24 @@ def load_sheet(path, threshold=None):
 
 def new_view(**kw):
     v = dict(cid=None, source="box", x0=0, x1=10, y0=0, y1=10,
-             role="ignore", facing="left", hflip=False)
+             role="ignore", facing="left", hflip=False,
+             gauge_h=None, gauge_v=None)
     v.update(kw)
     return v
+
+
+def view_axes(v):
+    """Which of the object's dimensions run across and down this view's image.
+
+    A view drawn a quarter turn round - facing 'up' or 'down' - has the two
+    swapped, so this cannot be read off the role alone. Everything downstream
+    asks here rather than indexing ROLE_AXES, or a rotated view would be
+    measured against the wrong figure and still look plausible.
+    """
+    ah, av = ROLE_AXES[v["role"]]
+    if v["role"] in FACING_ROLES and v.get("facing") in ("up", "down"):
+        return av, ah
+    return ah, av
 
 
 def detect_views(ink, gap=9, min_side=60):
@@ -91,15 +146,15 @@ def segmentation_quality(views, ink):
     for v in views:
         if (v["x1"] - v["x0"]) > 0.9 * w and (v["y1"] - v["y0"]) > 0.35 * h:
             return ["Auto-detect merged a large area into one region. This "
-                    "sheet's dimension lines probably join the views together. "
-                    "Switch to manual boxes: drag a rectangle over each view "
-                    "with its edges on the object's extremes."]
+                    "blueprint's dimension lines probably join the views "
+                    "together. Drag the region's edges apart by hand, or draw a "
+                    "box over each view with its edges on the object's extremes."]
     return []
 
 
 # Per view metrics, and symmetry detection
 def clamp_box(v, shape):
-    """Put a hand drawn box in order and inside the sheet.
+    """Put a hand drawn box in order and inside the blueprint.
 
     numpy slices silently, so an x1 typed past the right hand edge would trim
     the MASK but leave the reported span at the typed value, handing solve() a
@@ -118,8 +173,8 @@ def view_metrics(v, ink, lab):
     if v["source"] == "component" and v["cid"]:
         if lab is None:
             raise SolveError(
-                "A view still refers to an auto-detected region, but the sheet "
-                "has not been analysed. Press Detect views.")
+                "A view still refers to an auto-detected region, but the "
+                "blueprint has not been analysed. Press Detect views.")
         mask = ink & (lab == v["cid"])
         ys, xs = np.nonzero(mask)
         if len(xs) == 0:
@@ -134,7 +189,8 @@ def view_metrics(v, ink, lab):
         if x1 - x0 < 2 or y1 - y0 < 2:
             raise SolveError(
                 f"The box for view '{v['role']}' is too small, or lies off the "
-                f"sheet. Drag it again with its edges on the object's extremes.")
+                f"blueprint. Drag it again with its edges on the object's "
+                f"extremes.")
         mask = np.zeros_like(ink)
         mask[y0:y1 + 1, x0:x1 + 1] = ink[y0:y1 + 1, x0:x1 + 1]
         if not mask.any():
@@ -143,6 +199,46 @@ def view_metrics(v, ink, lab):
                 f"on blank paper - drag it over the view itself, or set this "
                 f"view to 'ignore'.")
     return mask, box[1] - box[0] + 1, box[3] - box[2] + 1, box
+
+
+def gauge_span(v, box, axis, shape):
+    """How many pixels the stated dimension covers, on one axis.
+
+    Without measure lines that is the whole view: the box, or the blob's ink,
+    IS the measurement. With them it is the distance between the two lines, so
+    a figure taken between two points inside the silhouette scales the drawing
+    correctly instead of being stretched onto its extremes.
+
+    Returns (pixels, whether measure lines were used).
+    """
+    key = "gauge_h" if axis == 0 else "gauge_v"
+    full = (box[1] - box[0] + 1) if axis == 0 else (box[3] - box[2] + 1)
+    g = v.get(key)
+    if not g:
+        return full, False
+    lim = (shape[1] if axis == 0 else shape[0]) - 1
+    a, b = sorted(int(round(max(0, min(lim, t)))) for t in g[:2])
+    if b - a < 2:
+        raise SolveError(
+            f"The measure lines on view '{v['role']}' are on top of each other "
+            f"({'across' if axis == 0 else 'down'} the view). Drag them onto "
+            f"the two points your dimension is taken between, or switch them "
+            f"off to measure the whole view.")
+    return b - a + 1, True
+
+
+def gauge_outside(v, box, axis, shape):
+    """True when a measure line sits outside the view it belongs to.
+
+    Legal - a dimension can be taken to a centre line drawn past the edge - but
+    it is far more often a line left behind after the box was moved, so it is
+    worth saying out loud.
+    """
+    g = v.get("gauge_h" if axis == 0 else "gauge_v")
+    if not g:
+        return False
+    lo, hi = (box[0], box[1]) if axis == 0 else (box[2], box[3])
+    return any(t < lo - 1 or t > hi + 1 for t in g[:2])
 
 
 SYM_BAND = 0.05      # axis may sit this far from the bbox midpoint, as a
@@ -196,10 +292,47 @@ def symmetry_axis(mask, box, axis):
 
 
 # Solving
-def solve(views, ink, lab, dims):
-    active = [v for v in views if v["role"] != "ignore"]
-    if not active:
+def active_views(views):
+    out = [v for v in views if v["role"] != "ignore"]
+    if not out:
         raise SolveError("No views assigned yet. Give at least one view a role.")
+    for v in out:
+        if v["role"] not in ROLE_AXES:
+            raise SolveError(f"'{v['role']}' is not a view role. Use one of: "
+                             + ", ".join(ROLE_AXES))
+    return out
+
+
+def proportional_dims(views, ink, lab, size_mm=PROPORTIONAL_MM):
+    """Dimensions taken from the drawing itself, for when real sizes do not matter.
+
+    One scale for the whole blueprint, so what comes out is the drawing's own
+    proportions; the object is then sized so its largest side is `size_mm`.
+    Views that measure the same axis are combined with a median, so one badly
+    placed box shifts the result less than it would if any single view were
+    trusted. Measure lines still apply, so a gauged view contributes the span
+    between its lines rather than its full width.
+
+    Nothing here is a real measurement, and the report says so.
+    """
+    px = {}
+    for v in active_views(views):
+        _, _, _, box = view_metrics(v, ink, lab)
+        ah, av = view_axes(v)
+        gh, _ = gauge_span(v, box, 0, ink.shape)
+        gv, _ = gauge_span(v, box, 1, ink.shape)
+        px.setdefault(ah, []).append(float(gh))
+        px.setdefault(av, []).append(float(gv))
+    med = {k: float(np.median(val)) for k, val in px.items()}
+    biggest = max(med.values())
+    if biggest <= 0:
+        raise SolveError("The assigned views have no measurable size.")
+    s = size_mm / biggest
+    return {k: round(val * s, 4) for k, val in med.items()}
+
+
+def solve(views, ink, lab, dims):
+    active = active_views(views)
     for k, val in dims.items():
         if not math.isfinite(val) or val <= 0:
             raise SolveError(
@@ -208,10 +341,7 @@ def solve(views, ink, lab, dims):
 
     report = {"views": [], "warnings": []}
     for v in active:
-        if v["role"] not in ROLE_AXES:
-            raise SolveError(f"'{v['role']}' is not a view role. Use one of: "
-                             + ", ".join(ROLE_AXES))
-        ah, av = ROLE_AXES[v["role"]]
+        ah, av = view_axes(v)
         missing = [a for a in (ah, av) if not dims.get(a)]
         if missing:
             raise SolveError(
@@ -219,17 +349,27 @@ def solve(views, ink, lab, dims):
                 f"{' and '.join(missing)} is blank. Enter it, or set this view "
                 f"to 'ignore'.")
         mask, sh_px, sv_px, box = view_metrics(v, ink, lab)
+        gh, used_h = gauge_span(v, box, 0, ink.shape)
+        gv, used_v = gauge_span(v, box, 1, ink.shape)
         rec = dict(role=v["role"], facing=v["facing"], axis_h=ah, axis_v=av,
-                   span_h=sh_px, span_v=sv_px, box=box,
-                   mm_px_h=dims[ah] / sh_px, mm_px_v=dims[av] / sv_px)
+                   span_h=sh_px, span_v=sv_px, gauge_h=gh, gauge_v=gv,
+                   gauged_h=used_h, gauged_v=used_v, box=box,
+                   mm_px_h=dims[ah] / gh, mm_px_v=dims[av] / gv)
         rec["anisotropy"] = rec["mm_px_h"] / rec["mm_px_v"]
-        # centre on the mirror line wherever the object is symmetric about it
-        if v["role"] in ("top", "bottom"):
-            rec["cen_h"] = (box[0] + box[1]) / 2
-            rec["cen_v"] = symmetry_axis(mask, box, 0)
-        elif v["role"] in ("front", "back"):
+        # The whole view in mm, which is what the exported plane will measure.
+        # Equal to the dimensions you typed unless measure lines are in use.
+        rec["full_h"] = sh_px * rec["mm_px_h"]
+        rec["full_v"] = sv_px * rec["mm_px_v"]
+        # Centre on the mirror line wherever the object is symmetric about it.
+        # That is the W axis - the object is mirrored about its own centre
+        # plane - so this follows the axis, not the image, and stays right on a
+        # view drawn a quarter turn round.
+        if ah == "W":
             rec["cen_h"] = symmetry_axis(mask, box, 1)
             rec["cen_v"] = (box[2] + box[3]) / 2
+        elif av == "W":
+            rec["cen_h"] = (box[0] + box[1]) / 2
+            rec["cen_v"] = symmetry_axis(mask, box, 0)
         else:
             rec["cen_h"] = (box[0] + box[1]) / 2
             rec["cen_v"] = (box[2] + box[3]) / 2
@@ -239,6 +379,13 @@ def solve(views, ink, lab, dims):
         rec["off_v"] = (rec["cen_v"] - (box[2] + box[3]) / 2) * rec["mm_px_v"]
         rec["_v"] = v
         report["views"].append(rec)
+
+        for axis, ax in ((0, ah), (1, av)):
+            if gauge_outside(v, box, axis, ink.shape):
+                report["warnings"].append(
+                    f"{v['role']}: a measure line for {ax} sits outside the "
+                    f"view's own box. That is allowed, but check it is not a "
+                    f"line left behind after the box was moved.")
 
     for r in report["views"]:
         for ax, off in (("h", r["off_h"]), ("v", r["off_v"])):
@@ -269,8 +416,27 @@ def solve(views, ink, lab, dims):
 
 
 # Exporting
-def export(views, ink, lab, dims, outdir, px_per_mm=4.0, margin=1.06,
-           mode="fit", prefix=""):
+def auto_px_per_mm(rep, need_h, need_v, detail=1.0, margin=MARGIN):
+    """Pick the output resolution from the drawing instead of asking for it.
+
+    One output pixel per source pixel is the ceiling on what a blueprint can
+    actually justify; past that the export is enlarging linework it does not
+    have. The median across views is used so one small inset does not drag the
+    whole export down, and the result is then held inside CANVAS_MIN_PX and
+    CANVAS_MAX_PX so neither a wall-sized drawing nor a thumbnail-sized object
+    produces an unusable canvas.
+    """
+    src = [1.0 / r[k] for r in rep["views"] for k in ("mm_px_h", "mm_px_v")]
+    p = float(np.median(src)) * float(detail)
+    side_mm = 2.0 * max(need_h, need_v) * margin
+    if side_mm > 0:
+        p = min(p, CANVAS_MAX_PX / side_mm)
+        p = max(p, CANVAS_MIN_PX / side_mm)
+    return max(p, 1e-6)
+
+
+def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
+           mode="fit", prefix="", detail="normal", proportional=False):
     """Write one PNG per assigned view onto one shared canvas.
 
     Every file gets the same canvas with the object centred in it, so all
@@ -282,16 +448,23 @@ def export(views, ink, lab, dims, outdir, px_per_mm=4.0, margin=1.06,
                      drawing gets skewed to match.
     mode 'uniform' - one scale per view. Keeps circles round and leaves any
                      mismatch visible instead of hiding it.
+
+    px_per_mm defaults to None, meaning work it out from the drawing; `detail`
+    ('draft', 'normal', 'fine', or a plain multiplier) nudges that up or down.
+    Pass a number to px_per_mm to override both.
     """
     if mode not in ("fit", "uniform"):
         raise SolveError(f"Unknown scaling mode '{mode}'. Use 'fit' or 'uniform'.")
-    if not math.isfinite(px_per_mm) or px_per_mm <= 0:
-        raise SolveError("px per mm must be a positive number.")
+    if isinstance(detail, str):
+        if detail not in DETAIL:
+            raise SolveError(f"Unknown detail '{detail}'. Use one of: "
+                             + ", ".join(DETAIL))
+        detail = DETAIL[detail]
     if not math.isfinite(margin) or margin < 1.0:
         raise SolveError(
             f"margin is {margin}. It is a multiplier on the canvas and must be "
             f"at least 1.0 - below that the canvas is smaller than the object "
-            f"and the edges of your reference get cut off. Try 1.06.")
+            f"and the edges of your reference get cut off.")
 
     rep = solve(views, ink, lab, dims)
     L, W, H = dims.get("L", 0), dims.get("W", 0), dims.get("H", 0)
@@ -313,6 +486,12 @@ def export(views, ink, lab, dims, outdir, px_per_mm=4.0, margin=1.06,
     # in the Blender report keep meaning what they say.
     need_h = max([max(L, W) / 2.0] + [r["reach_h"] for r in rep["views"]])
     need_v = max([max(H, W) / 2.0] + [r["reach_v"] for r in rep["views"]])
+
+    if px_per_mm is None:
+        px_per_mm = auto_px_per_mm(rep, need_h, need_v, detail, margin)
+    if not math.isfinite(px_per_mm) or px_per_mm <= 0:
+        raise SolveError("px per mm must be a positive number.")
+
     CW = max(2, int(round(2 * need_h * margin * px_per_mm)))
     CH = max(2, int(round(2 * need_v * margin * px_per_mm)))
     grew = (CW > int(round(max(L, W) * margin * px_per_mm)) + 1 or
@@ -342,18 +521,18 @@ def export(views, ink, lab, dims, outdir, px_per_mm=4.0, margin=1.06,
         dw, dh = round((x1 - x0 + 1) * kh), round((y1 - y0 + 1) * kv)
         if dw < 2 or dh < 2:
             raise SolveError(
-                f"At {px_per_mm} px per mm the '{v['role']}' view comes out "
+                f"At {px_per_mm:.3f} px per mm the '{v['role']}' view comes out "
                 f"{max(dw,0)} x {max(dh,0)} pixels, which is not an image. "
-                f"Raise px per mm - around 4 suits most sheets.")
+                f"Raise the detail setting.")
         reg = img.crop((x0, y0, x1 + 1, y1 + 1)).resize((dw, dh), Image.LANCZOS)
         # Downscaling far enough thins the linework until nothing survives the
         # ink threshold. The file still writes, and it is blank, so catch it
-        # here, where px_per_mm can actually be named as the cause.
+        # here, where the resolution can actually be named as the cause.
         if np.asarray(reg).min() >= 200:
             raise SolveError(
-                f"At {px_per_mm} px per mm the '{v['role']}' view renders to "
-                f"{dw} x {dh} pixels and its linework disappears. Raise px per "
-                f"mm - around 4 suits most sheets.")
+                f"At {px_per_mm:.3f} px per mm the '{v['role']}' view renders to "
+                f"{dw} x {dh} pixels and its linework disappears. Raise the "
+                f"detail setting.")
         canvas = Image.new("L", (CW, CH), 255)
         # PIL maps the crop's full width onto dw, so step through dw/src
         # rather than kh; at small scales the two differ by enough to see.
@@ -363,25 +542,30 @@ def export(views, ink, lab, dims, outdir, px_per_mm=4.0, margin=1.06,
         if v["hflip"]:
             canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
 
-        stem = (f"{v['role']}_{v['facing']}" if v["role"] in ("side", "top", "bottom")
+        stem = (f"{v['role']}_{v['facing']}" if v["role"] in FACING_ROLES
                 else v["role"])
         seen[stem] = seen.get(stem, 0) + 1
         if seen[stem] > 1:
             stem = f"{stem}{seen[stem]}"
         name = f"{prefix}{stem}.png"
         canvas.save(os.path.join(outdir, name))
-        # want_mm is what you typed. expect_mm is what THIS mode should
-        # produce: the same in 'fit', different by the view's skew in 'uniform'.
+        # want_mm is the whole view at the scale your figures set - the same as
+        # the figures themselves unless measure lines are in use, where the view
+        # runs past them on purpose. expect_mm is what THIS mode should produce:
+        # equal to want_mm in 'fit', different by the view's skew in 'uniform'.
         # Keeping both lets verify separate an export fault from the drawing's
         # own inconsistency.
         written.append(dict(file=name, role=v["role"], facing=v["facing"],
-                            want_mm=[dims[r["axis_h"]], dims[r["axis_v"]]],
+                            axes=[r["axis_h"], r["axis_v"]],
+                            gauged=bool(r["gauged_h"] or r["gauged_v"]),
+                            want_mm=[r["full_h"], r["full_v"]],
                             expect_mm=[r["span_h"] * r["kh"], r["span_v"] * r["kv"]],
                             off_mm=[r["off_h"], r["off_v"]]))
 
     meta = dict(canvas_px=[CW, CH],
                 canvas_mm=[round(CW / px_per_mm, 2), round(CH / px_per_mm, 2)],
                 px_per_mm=px_per_mm, mode=mode, margin=margin, dims=dims,
+                detail=detail, proportional=bool(proportional),
                 outdir=os.path.abspath(outdir), files=written)
     with open(os.path.join(outdir, "placement.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -392,16 +576,30 @@ def export(views, ink, lab, dims, outdir, px_per_mm=4.0, margin=1.06,
 
 
 # Verification
+def file_axes(f):
+    """The axes a written file was measured on. Stored per file, because a
+    rotated view's axes do not follow from its role."""
+    ax = f.get("axes")
+    return (ax[0], ax[1]) if ax else ROLE_AXES[f["role"]]
+
+
 def verify(outdir, meta):
     """Remeasure the finished files off disk. Does not trust export().
 
     Returns (text, worst_mm, problems). worst_mm is the export's own error, how
     far each written file is from what this mode set out to produce, so it stays
-    near zero in 'uniform' mode too. Deviation from the typed dimensions is
+    near zero in 'uniform' mode too. Deviation from the expected extent is
     reported separately, because the two mean different things.
     """
     P = meta["px_per_mm"]
     CW, CH = meta["canvas_px"]
+    # Tolerances are a canvas pixel and a half, converted to mm, rather than a
+    # fixed fraction of one. Placing a view involves two roundings to whole
+    # pixels, so a pixel of slop is the floor on what any export can achieve -
+    # and a hard 0.5 mm floor calls that a fault on a coarse canvas while
+    # letting real drift through on a fine one. In proportional mode, where the
+    # millimetres are arbitrary, a figure in mm means nothing at all.
+    SLOP = 1.5 / P
     imgs, info = {}, {}
     for f in meta["files"]:
         a = np.asarray(Image.open(os.path.join(outdir, f["file"])).convert("L"))
@@ -412,7 +610,7 @@ def verify(outdir, meta):
     lines, worst, worst_dim = ["measured extents (mm)"], 0.0, 0.0
     for fn, m in imgs.items():
         f = info[fn]
-        ah, av = ROLE_AXES[f["role"]]
+        ah, av = file_axes(f)
         ys, xs = np.nonzero(m)
         if len(xs) == 0:
             problems.append(f"{fn} came out completely blank.")
@@ -425,21 +623,21 @@ def verify(outdir, meta):
         gv = (ys.max() - ys.min() + 1) / P
         worst = max(worst, abs(gh - exp[0]), abs(gv - exp[1]))
         worst_dim = max(worst_dim, abs(gh - want[0]), abs(gv - want[1]))
+        tag = "  (measure lines)" if f.get("gauged") else ""
         lines.append(f"  {fn:24s} {ah}={gh:8.2f} (want {want[0]:7.2f})   "
-                     f"{av}={gv:8.2f} (want {want[1]:7.2f})")
+                     f"{av}={gv:8.2f} (want {want[1]:7.2f}){tag}")
 
         # Ink on the border means the canvas cut the view off. A clipped view
         # still reports an extent, just a short one, so this needs its own check.
         if xs.min() == 0 or ys.min() == 0 or xs.max() == CW - 1 or ys.max() == CH - 1:
-            problems.append(f"{fn} touches the canvas edge - it is being cut "
-                            f"off. Raise margin.")
+            problems.append(f"{fn} touches the canvas edge - it is being cut off.")
 
         # Did export put the view where solve asked? Deliberate centring
         # offsets are subtracted, so what is left is placement error.
         off = f.get("off_mm", [0.0, 0.0])
         dh = ((xs.min() + xs.max()) / 2 - (CW - 1) / 2) / P + off[0]
         dv = ((ys.min() + ys.max()) / 2 - (CH - 1) / 2) / P + off[1]
-        if max(abs(dh), abs(dv)) > max(0.5, 0.002 * max(want)):
+        if max(abs(dh), abs(dv)) > max(SLOP, 0.002 * max(want)):
             problems.append(f"{fn} is off centre by ({dh:+.2f}, {dv:+.2f}) mm.")
 
         # And was that what solve should have asked for? Subtracting the
@@ -447,14 +645,14 @@ def verify(outdir, meta):
         # lands exactly where it was told to, so the size of the intention is
         # checked on its own.
         for k, ax in ((0, ah), (1, av)):
-            if abs(off[k]) > max(0.5, 0.02 * want[k]):
+            if abs(off[k]) > max(SLOP, 0.02 * want[k]):
                 problems.append(
                     f"{fn} was centred {off[k]:+.2f} mm off its bounding-box "
                     f"midpoint on {ax}, to sit on the mirror line found in the "
                     f"drawing. Correct only if this view really is symmetric "
                     f"about that line - check it against the others.")
-    lines.append(f"  worst deviation from the dimensions you typed: "
-                 f"{worst_dim:.2f} mm")
+    lines.append(f"  worst deviation from the expected extent: {worst_dim:.2f} mm "
+                 f"({worst_dim * P:.1f} canvas px)")
 
     def corr(a, b, axis, win_px):
         """Best lag within +/-win_px and how strong that peak is.
@@ -482,9 +680,8 @@ def verify(outdir, meta):
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = names[i], names[j]
-            ra, rb = info[a]["role"], info[b]["role"]
-            for axa, axb, ax in ((ROLE_AXES[ra][0], ROLE_AXES[rb][0], 0),
-                                 (ROLE_AXES[ra][1], ROLE_AXES[rb][1], 1)):
+            fa, fb = file_axes(info[a]), file_axes(info[b])
+            for axa, axb, ax in ((fa[0], fb[0], 0), (fa[1], fb[1], 1)):
                 if axa != axb:
                     continue
                 win = int(round(max(5.0, 0.02 * meta["dims"][axa]) * P))
@@ -535,11 +732,15 @@ AXIS_ONLY = False        # True = each plane only appears in its own ortho view
 '''
 
 
+def placement_key(f):
+    return (f["role"], f["facing"] if f["role"] in FACING_ROLES else "n/a")
+
+
 def blender_script(meta):
     """Emit a standalone .py that builds the planes in Blender.
 
     Everything it needs is baked in, so it does not import viewforge and does
-    not need the sheet, just the PNGs sitting beside it.
+    not need the blueprint, just the PNGs sitting beside it.
     """
     CW, CH = meta["canvas_px"]
     cw_mm, ch_mm = meta["canvas_mm"]
@@ -550,8 +751,7 @@ def blender_script(meta):
 
     rows = []
     for f in meta["files"]:
-        key = (f["role"], f["facing"] if f["role"] in ("side", "top", "bottom") else "n/a")
-        b = BLENDER.get(key)
+        b = BLENDER.get(placement_key(f))
         if b is None:
             continue
         ax = "XYZ".index(b["normal"][1])
@@ -668,20 +868,24 @@ def blender_report(meta):
     push = max(L, W, H) * 0.75 / 1000.0
     o = ["BLENDER SETUP",
          f"  canvas   {CW} x {CH} px  =  {cw_mm} x {ch_mm} mm "
-         f"at {meta['px_per_mm']} px/mm", "",
-         "  DO IT FOR ME:  viewforge_import.py, written beside these planes.",
-         "     Blender > Scripting > Open > Run Script, and it builds all of",
-         "     them. Everything below is the same job done by hand.", "",
-         "  Add > Empty > Image, one per file. Set these on EVERY empty,",
-         "  identically, only rotation differs:",
-         f"      Size      {size_m:.4f}",
-         "      Offset X  -0.5        Offset Y  -0.5",
-         "      Depth     Back        Side  Front       Opacity  0.5", "",
-         f"  {'file':24s} {'RotX':>5s} {'RotY':>5s} {'RotZ':>5s}  "
-         f"{'location':13s} {'view key':14s}"]
+         f"at {meta['px_per_mm']:.3f} px/mm", ""]
+    if meta.get("proportional"):
+        o += ["  PROPORTIONAL EXPORT. These millimetres are not measurements.",
+              f"  The drawing's own proportions were kept and the object scaled",
+              f"  so its largest side is {max(L, W, H):.0f} mm. Everything lines up",
+              "  and is in proportion; nothing here is a real world size.", ""]
+    o += ["  DO IT FOR ME:  viewforge_import.py, written beside these planes.",
+          "     Blender > Scripting > Open > Run Script, and it builds all of",
+          "     them. Everything below is the same job done by hand.", "",
+          "  Add > Empty > Image, one per file. Set these on EVERY empty,",
+          "  identically, only rotation differs:",
+          f"      Size      {size_m:.4f}",
+          "      Offset X  -0.5        Offset Y  -0.5",
+          "      Depth     Back        Side  Front       Opacity  0.5", "",
+          f"  {'file':24s} {'RotX':>5s} {'RotY':>5s} {'RotZ':>5s}  "
+          f"{'location':13s} {'view key':14s}"]
     for f in meta["files"]:
-        key = (f["role"], f["facing"] if f["role"] in ("side", "top", "bottom") else "n/a")
-        b = BLENDER.get(key)
+        b = BLENDER.get(placement_key(f))
         if b is None:
             o.append(f"  {f['file']:24s}  ?  no placement for role "
                      f"'{f['role']}' facing '{f['facing']}'")

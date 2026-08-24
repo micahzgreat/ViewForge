@@ -1,0 +1,9 @@
+# ViewForge dependencies.  Install with:  pip install -r requirements.txt
+#
+# Tkinter is NOT here because it is not a pip package - it ships with Python on
+# Windows and macOS. On Linux it is a system package: sudo apt install python3-tk
+
+pillow>=10.0          # reads the blueprint, writes the planes
+numpy>=1.24           # the ink mask and every measurement taken from it
+scipy>=1.10           # connected-component labelling behind Detect views
+customtkinter>=5.2    # the interface
