@@ -1,3 +1,5 @@
+<img width="1254" height="533" alt="header" src="https://github.com/user-attachments/assets/dcc2bdb7-99d7-4461-a479-9135b8a8d1e6" />
+
 # ViewForge
 
 Turns a multi-view blueprint sheet into orthographic reference planes that
