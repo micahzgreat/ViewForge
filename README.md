@@ -1,5 +1,7 @@
 <img width="1254" height="533" alt="header" src="https://github.com/user-attachments/assets/dcc2bdb7-99d7-4461-a479-9135b8a8d1e6" />
 
+<a href='https://ko-fi.com/I3I01ADVKL' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi4.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
 # ViewForge
 
 Turns a multi-view blueprint into orthographic reference planes that actually
