@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-viewforge - blueprint to verified Blender reference planes.
+ViewForge. Turns a blueprint into verified Blender reference planes.
 
 Run:  python viewforge_gui.py
-Needs: pip install pillow numpy scipy customtkinter
 """
 
 import os, traceback
@@ -76,10 +75,9 @@ class App(ctk.CTk):
         self._build()
         self._set_icon()
 
-    # CustomTkinter takes its geometry in scaled units and multiplies by the
-    # display's DPI factor, so a fixed 1520x950 becomes 1900x1154 on a 125%
-    # screen and hangs off the edge. Everything here is worked out in the same
-    # scaled units the geometry string is read in.
+    # CustomTkinter multiplies geometry by the display's DPI factor, so a fixed
+    # 1520x950 becomes 1900x1154 on a 125% screen and hangs off the edge. Work
+    # in the same scaled units the geometry string is read in.
     def _size_window(self):
         try:
             scl = ctk.ScalingTracker.get_window_scaling(self)
@@ -93,8 +91,8 @@ class App(ctk.CTk):
         self.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2),
                                        max(0, (sh - h) // 2 - 15)))
 
-    # CustomTkinter re-applies its own window icon shortly after the window
-    # appears, so ours has to be set again once that has happened.
+    # CustomTkinter re-applies its own icon just after the window appears, so
+    # ours has to be set again afterwards.
     def _set_icon(self):
         if not os.path.exists(ICON):
             return
@@ -236,8 +234,8 @@ class App(ctk.CTk):
         self._build_dims(side)
         self._build_output(side)
 
-        # The two actions sit outside the scrolling area, so a blueprint with a
-        # lot of detected regions cannot push them off the bottom.
+        # Outside the scrolling area, so a long list of regions cannot push
+        # these off the bottom.
         act = ctk.CTkFrame(col, fg_color="transparent")
         act.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         ctk.CTkButton(act, text="Check the blueprint", height=38, font=UI_B,
@@ -290,9 +288,8 @@ class App(ctk.CTk):
             ctk.CTkEntry(g, textvariable=v, width=90, font=MONO).grid(
                 row=r, column=c + 1, sticky="ew", padx=(0, 10), pady=4)
 
-        # Measure lines. The box says where the view is; these say where the
-        # figure you typed was actually taken from, for a drawing whose
-        # dimension does not reach the object's extremes.
+        # The box says where the view is; these say where the figure you typed
+        # was taken from.
         ctk.CTkLabel(ed, text="MEASURE LINES", font=UI_CAP, text_color=FG_MUTED,
                      anchor="w").pack(fill="x", padx=14, pady=(6, 0))
         ctk.CTkLabel(ed, text="Off, the whole view is the measurement. On, the "
@@ -367,9 +364,8 @@ class App(ctk.CTk):
         o.pack(fill="x", padx=12, pady=(0, 12))
         o.grid_columnconfigure(0, weight=1)
 
-        # Resolution used to be a px-per-mm figure you had to guess at, with a
-        # separate margin next to it. Both are worked out from the drawing now;
-        # this only says how hard to push it.
+        # Resolution and margin both come from the drawing now. This only says
+        # how hard to push it.
         ctk.CTkLabel(o, text="detail", font=UI, anchor="w").grid(
             row=0, column=0, sticky="w", pady=(0, 2))
         self.detail = tk.StringVar(value="normal")
@@ -567,10 +563,8 @@ class App(ctk.CTk):
     def _gauge_pts(self, v):
         """Where each measure line's grab handle sits, in screen pixels.
 
-        Outside the box on purpose. A measure line switched on for the first
-        time lands exactly on the box edge, which is the honest starting point
-        because it changes nothing - but it would make the two impossible to
-        tell apart under the pointer if they shared a grab zone.
+        Outside the box on purpose: a new pair starts on the box edges, and the
+        two would be impossible to tell apart if they shared a grab zone.
         """
         out = []
         x0, y0 = self._box_screen(v)[:2]
@@ -620,9 +614,8 @@ class App(ctk.CTk):
         if sx1 - sx0 > 0.5 and sy1 - sy0 > 0.5:
             dw = max(1, int(round((sx1 - sx0) * self.zoom)))
             dh = max(1, int(round((sy1 - sy0) * self.zoom)))
-            # Only the visible slice is ever resampled, so a big blueprint stays
-            # responsive at any zoom. Past 1:1 nearest keeps the pixel edges
-            # hard, which is the point of zooming in to place a box edge.
+            # Only the visible slice is resampled, so a big blueprint stays
+            # responsive. Past 1:1, nearest keeps the pixel edges hard.
             samp = Image.NEAREST if self.zoom > 2.0 else Image.BILINEAR
             reg = self.base.resize((dw, dh), samp, box=(sx0, sy0, sx1, sy1))
             self.photo = ImageTk.PhotoImage(reg)
@@ -746,11 +739,8 @@ class App(ctk.CTk):
         self.redraw()
 
     def sync_fields(self):
-        """Push the selected view's numbers back into the entries.
-
-        Guarded, because dragging a handle calls this on every mouse motion and
-        the entries are two-way.
-        """
+        """Push the selected view's numbers back into the entries. Guarded,
+        since a handle drag calls this on every mouse motion."""
         if self.sel is None:
             return
         self.syncing = True
@@ -771,12 +761,9 @@ class App(ctk.CTk):
             self.syncing = False
 
     def _facing_state(self, v):
-        """'front of object is at' only means something on a side, top or bottom.
-
-        On front and back the object's front faces the viewer, so the question
-        has no answer and the control is switched off rather than left showing a
-        value that does nothing.
-        """
+        """The facing question only means something on a side, top or bottom.
+        Elsewhere the control is switched off rather than left showing a value
+        that does nothing."""
         if v["role"] in core.FACING_ROLES:
             if v["facing"] not in core.FACINGS:
                 v["facing"] = "left"
@@ -805,12 +792,8 @@ class App(ctk.CTk):
         self.redraw()
 
     def toggle_gauge(self, key):
-        """Switch a pair of measure lines on or off for the selected view.
-
-        A new pair starts on the box's own edges, so switching it on changes
-        nothing until you move it. Anything else would silently rescale the view
-        the moment the switch was touched.
-        """
+        """Switch a pair of measure lines on or off. A new pair starts on the
+        box edges, so it changes nothing until you move one."""
         if self.sel is None:
             if any(self.gauge_on[k].get() for k in ("h", "v")):
                 self.gauge_on[key].set(False)
@@ -888,7 +871,7 @@ class App(ctk.CTk):
         self.refresh_list()
         self.redraw()
 
-    # Editing on the blueprint: handles, and dragging a new box
+    # Editing: handles, and dragging a new box
     def _hit(self, i, cx, cy):
         """What part of view i is under the pointer, if any."""
         v = self.views[i]
@@ -911,8 +894,8 @@ class App(ctk.CTk):
         return None
 
     def _grab(self, cx, cy):
-        """The selected view's handles win, so a box drawn over another one is
-        still fully editable rather than being shadowed by whatever is on top."""
+        """Selected view's handles win, so a box under another one stays
+        editable."""
         order = ([self.sel] if self.sel is not None else [])
         order += [j for j in reversed(range(len(self.views))) if j != self.sel]
         for i in order:
@@ -924,10 +907,8 @@ class App(ctk.CTk):
     def _to_box(self, v):
         """An edited auto-detected region becomes a hand box.
 
-        It has to: a component measures its own blob of ink and ignores its
-        rectangle, so a rectangle you have just moved would have no effect at
-        all. As a box, the rectangle is the measurement, which is what moving it
-        was for.
+        It has to. A component measures its own ink and ignores its rectangle,
+        so the rectangle you just dragged would do nothing.
         """
         if v["source"] == "component":
             v["source"], v["cid"] = "box", None
@@ -995,9 +976,8 @@ class App(ctk.CTk):
                 bw, bh = x1 - x0, y1 - y0
                 nx0 = int(round(max(0, min(w - 1 - bw, x0 + dx))))
                 ny0 = int(round(max(0, min(h - 1 - bh, y0 + dy))))
-                # Measure lines are marks on the drawing, so an edge drag leaves
-                # them where they are - but moving the whole view means the view
-                # sits somewhere else, and they have to come with it.
+                # Measure lines stay put on an edge drag, but the whole view
+                # moving means they have to come with it.
                 sx, sy = nx0 - x0, ny0 - y0
                 for fld, s, lim in (("gauge_h", sx, w - 1), ("gauge_v", sy, h - 1)):
                     src = ed["g"][0 if fld == "gauge_h" else 1]
@@ -1046,8 +1026,8 @@ class App(ctk.CTk):
         self.drag = None
         x0, x1 = sorted((int(round(ax)), int(round(bx))))
         y0, y1 = sorted((int(round(ay)), int(round(by))))
-        # A tiny drag is a misclick at any zoom, so it has to clear both a
-        # minimum on the blueprint and a minimum distance moved on screen.
+        # A tiny drag is a misclick, so it has to clear a minimum both on the
+        # blueprint and on screen.
         if (x1 - x0 < MIN_BOX or y1 - y0 < MIN_BOX or
                 (x1 - x0) * self.zoom < 6 or (y1 - y0) * self.zoom < 6):
             self.redraw()
@@ -1059,7 +1039,7 @@ class App(ctk.CTk):
         self.refresh_list()
         self.select(len(self.views) - 1)
 
-    # Actions that use the core library to check the blueprint or export planes
+    # Checking and exporting
     def num(self, var, label):
         try:
             return float(var.get())
