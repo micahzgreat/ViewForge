@@ -6,11 +6,12 @@ actually line up in Blender, and prints the numbers to place them with.
 ## Install
 
 ```
-pip install pillow numpy scipy
+pip install customtkinter pillow numpy scipy
 python viewforge_gui.py
 ```
 
-Tkinter ships with Python on Windows and macOS. On Linux: `sudo apt install python3-tk`.
+CustomTkinter provides the modern themed interface. Tkinter ships with Python on
+Windows and macOS. On Linux: `sudo apt install python3-tk`.
 
 ## Workflow
 
