@@ -206,7 +206,7 @@ SYM_GAIN = 0.05      # and only if it beats the midpoint by this much
 
 
 def symmetry_axis(mask, box, axis):
-    """Find a view's mirror line. axis=0 horizontal, 1 vertical.
+    """Find a view's mirror line. axis=0 returns a row, 1 returns a column.
 
     Candidates stay in a band around the midpoint, every one is scored over the
     same width so an edge axis cannot win by comparing almost nothing, and the
@@ -308,20 +308,43 @@ def solve(views, ink, lab, dims):
         # The whole view in mm, which is what the exported plane measures.
         rec["full_h"] = sh_px * rec["mm_px_h"]
         rec["full_v"] = sv_px * rec["mm_px_v"]
-        # Objects mirror about their width axis, so follow W wherever it landed
-        # in the image rather than assuming the view is upright.
+        # Every view is centred on its own box, on every axis. The box is what
+        # the stated dimension was measured against, so it is the only centre
+        # two views can be relied on to agree about.
+        rec["cen_h"] = (box[0] + box[1]) / 2
+        rec["cen_v"] = (box[2] + box[3]) / 2
+        rec["off_h"] = rec["off_v"] = 0.0
+        # The mirror line is still looked for, and still reported, but it is
+        # not applied. Each view finds it in its own ink, so views sharing the
+        # width axis used to be shifted by different amounts, in opposite
+        # directions as often as not - and two planes shifted differently is
+        # precisely what fails to line up in Blender. It is now a statement
+        # about the drawing, not a change made to it.
         if ah == "W":
-            rec["cen_h"] = symmetry_axis(mask, box, 1)
-            rec["cen_v"] = (box[2] + box[3]) / 2
+            rec["sym_off"] = ((symmetry_axis(mask, box, 1)
+                               - rec["cen_h"]) * rec["mm_px_h"])
         elif av == "W":
-            rec["cen_h"] = (box[0] + box[1]) / 2
-            rec["cen_v"] = symmetry_axis(mask, box, 0)
+            rec["sym_off"] = ((symmetry_axis(mask, box, 0)
+                               - rec["cen_v"]) * rec["mm_px_v"])
         else:
-            rec["cen_h"] = (box[0] + box[1]) / 2
-            rec["cen_v"] = (box[2] + box[3]) / 2
-        # How far centring moved the view off its own midpoint.
-        rec["off_h"] = (rec["cen_h"] - (box[0] + box[1]) / 2) * rec["mm_px_h"]
-        rec["off_v"] = (rec["cen_v"] - (box[2] + box[3]) / 2) * rec["mm_px_v"]
+            rec["sym_off"] = 0.0
+        # A component renders from its own blob alone. Ink inside its bounds
+        # that belongs to something else is not exported, and a hole or an
+        # island floating free of the outline is exactly that.
+        if v["source"] == "component":
+            x0, x1, y0, y1 = box
+            here = ink[y0:y1 + 1, x0:x1 + 1]
+            lost = int(here.sum()) - int(mask[y0:y1 + 1, x0:x1 + 1].sum())
+            own = int(mask.sum())
+            if lost > 50 and lost > 0.02 * own:
+                report["warnings"].append(
+                    f"{v['role']}: {lost} pixels of ink inside this region are "
+                    f"not part of it and will not be exported - detail that "
+                    f"floats free of the outline, like a hole or an island of "
+                    f"hatching, is its own region. Raise the merge gap until it "
+                    f"joins on, or draw a box over the view instead, where "
+                    f"everything inside the box is kept.")
+
         rec["_v"] = v
         report["views"].append(rec)
 
@@ -332,15 +355,27 @@ def solve(views, ink, lab, dims):
                     f"view's own box. That is allowed, but check it is not a "
                     f"line left behind after the box was moved.")
 
+    # Where the mirror lines landed, and above all whether the views agree
+    # about them. Nothing was shifted, so this is a reading of the drawing.
+    sym = [r for r in report["views"] if r.get("sym_off")]
+    for r in sym:
+        if abs(r["sym_off"]) > 0.02 * dims["W"]:
+            report["warnings"].append(
+                f"{r['role']}: its mirror line sits {abs(r['sym_off']):.1f} mm "
+                f"off the middle of its box on W. Nothing has been moved - every "
+                f"view is centred on its box. But if the view really is symmetric "
+                f"about that line, then its box is not centred on the object, and "
+                f"the box is what the measurement is taken from.")
+    if len(sym) > 1:
+        spread = max(r["sym_off"] for r in sym) - min(r["sym_off"] for r in sym)
+        if spread > 0.02 * dims["W"]:
+            report["warnings"].append(
+                f"Views disagree about where the object's mirror line is, by "
+                f"{spread:.1f} mm across W. At least one of their boxes is off "
+                f"centre on the width axis, and that view will sit off the "
+                f"others in Blender.")
+
     for r in report["views"]:
-        for ax, off in (("h", r["off_h"]), ("v", r["off_v"])):
-            lim = 0.02 * dims[r["axis_" + ax]]
-            if abs(off) > lim:
-                report["warnings"].append(
-                    f"{r['role']}: centred {abs(off):.1f} mm off its bounding-box "
-                    f"midpoint, on the {r['axis_' + ax]} axis. That is the mirror "
-                    f"line this view was drawn about. If the view is not actually "
-                    f"symmetric, this shifts it against the others.")
         off = abs(r["anisotropy"] - 1) * 100
         if off > 1.0:
             report["warnings"].append(

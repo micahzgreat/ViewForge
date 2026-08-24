@@ -17,8 +17,9 @@ its own output files and tells you how far off they came out.
   this process to get wrong.
 - **It checks its own work.** Extents are re-measured from the written PNGs, not
   from the export's own arithmetic.
-- **It does not guess quietly.** A drawing that is out of square, a view that is
-  not really symmetric, a measure line left somewhere odd: you get told.
+- **It does not guess quietly.** A drawing that is out of square, two views that
+  disagree about the object's centre line, a measure line left somewhere odd:
+  you get told, and nothing is silently corrected on your behalf.
 
 ---
 
@@ -315,13 +316,35 @@ also what a missing measure line looks like.
 `fit` mode will still line the planes up by stretching the worst view that far.
 `uniform` mode leaves the mismatch visible.
 
-**"Centred N mm off its bounding-box midpoint".** Deliberate. `top`, `bottom`,
-`front` and `back` are centred on the mirror line found in the drawing rather
-than on their bounding box, which is what you want for modelling against a
-Mirror modifier. It is only correct if the view really is symmetric, so it gets
-stated instead of applied silently. The mirror line is looked for on the
-object's width axis wherever that lands in the image, so it stays right on a
-view drawn a quarter turn round.
+**"Its mirror line sits N mm off the middle of its box".** Every view is centred
+on its box, on every axis, and nothing here has been moved. This is a reading of
+the drawing: on `top`, `bottom`, `front` and `back` the tool looks for the line
+the view was drawn symmetric about, on the object's width axis wherever that
+lands in the image, so it stays right on a view drawn a quarter turn round. If
+the view really is symmetric and its mirror line is not in the middle of its
+box, then the box is not centred on the object, and the box is what the
+measurement is taken from. Move it. If the view is simply not symmetric, which
+is the usual answer, ignore this.
+
+**"Views disagree about where the object's mirror line is".** Two views that
+share the width axis found their mirror lines in different places. At least one
+of their boxes is off centre on W, and that view will sit off the others in
+Blender. This is the one to act on.
+
+> Earlier versions *applied* the mirror line, centring each of `top`, `bottom`,
+> `front` and `back` on the line found in its own ink. Views sharing the width
+> axis were shifted by different amounts, often in opposite directions, by up to
+> 5% of a view's span each way, and the planes did not line up. Worse, the
+> self-check subtracted the intended shift before measuring, so the export
+> graded itself as perfect. Views are now centred on their boxes and the mirror
+> line is only reported. If you have exports from before this change, redo them.
+
+**"N pixels of ink inside this region are not part of it".** An auto-detected
+region renders from its own blob of ink alone, so detail that floats free of the
+outline - a hole, an island of hatching, text sitting inside the view - is its
+own region and does not reach the exported plane. Raise the merge gap until it
+joins on, or draw a box over the view instead, where everything inside the box
+is kept.
 
 **"Touches the canvas edge".** A plane got cut off. Rare, since the canvas
 normally grows to prevent it.
