@@ -8,12 +8,11 @@ actually line up in Blender, and prints the numbers to place them with.
 ## Install
 
 ```
-pip install pillow numpy scipy customtkinter
+pip install pillow numpy scipy
 python viewforge_gui.py
 ```
 
 Tkinter ships with Python on Windows and macOS. On Linux: `sudo apt install python3-tk`.
-CustomTkinter draws the interface on top of it.
 
 ## Workflow
 
@@ -29,25 +28,6 @@ CustomTkinter draws the interface on top of it.
 5. **Check the sheet.** Read the warnings before exporting.
 6. **Export planes.** Writes one PNG per view, a `report.txt`, and a
    `placement.json`.
-
-## Navigating the sheet
-
-The sheet view pans and zooms, which is what makes a hand-drawn box accurate
-rather than approximate: zoom in until the individual ink pixels are separate
-and put the edge exactly where you mean it.
-
-| | |
-|---|---|
-| zoom | mouse wheel, or the `-` / `+` buttons |
-| pan | middle-drag, right-drag, ctrl-drag, or the arrow keys |
-| fit the whole sheet | `Fit`, or press `F` |
-| actual pixels | `1:1` |
-| frame the selected view | `Zoom to selection` |
-
-The readout at the right of the navigation bar gives the sheet pixel under the
-cursor, and past 1:1 the sheet is drawn without smoothing so pixel edges stay
-hard. Zoom and pan are display only, they never touch the numbers: a box always
-records the sheet pixels it covers, whatever zoom it was drawn at.
 
 ## Drawing boxes by hand
 
@@ -118,7 +98,7 @@ symmetric, so it is now stated outright instead of applied silently.
 the canvas is smaller than the object and the edges of your reference are cut
 off, which is not something you want to discover after tracing.
 
-The canvas is normally `max(L,W) x max(H,W)` scaled by `margin`, but it will
+The canvas is normally `max(L,W) × max(H,W)` scaled by `margin`, but it will
 **grow beyond that** if centring on a mirror line would otherwise push part of a
 view over the edge. When that happens the report says so. Every plane still
 shares the one canvas, so the single Size and Offset pair still applies to all
@@ -142,9 +122,7 @@ up with two exports mixed together.
 
 There is a settings block at the top for opacity, draw depth, whether the planes
 are locked against being dragged, and whether each one only appears in its own
-orthographic view. The defaults are `DEPTH = 'BACK'`, so the planes draw behind
-your model instead of through it, and `SIDE = 'FRONT'`, so a plane is invisible
-from behind and does not obscure the view when you orbit past it.
+orthographic view.
 
 The planes are created locked. Unlock in the N-panel, or set `LOCK = False`.
 
@@ -156,11 +134,11 @@ are the easiest thing in this whole process to get wrong.
 > The Size figure is the canvas's **longer** side in metres. That is not a guess
 > about how Blender treats image empties. An image empty is drawn with its
 > larger pixel dimension equal to `Size`, which was measured in Blender 5.2 by
-> rendering a 636x1272 empty at `Size 0.5` through a 1.0-unit orthographic
-> camera: it came out 99x199 px in a 400 px frame, not 200x400.
+> rendering a 636×1272 empty at `Size 0.5` through a 1.0-unit orthographic
+> camera: it came out 99×199 px in a 400 px frame, not 200×400.
 
 The object ends up centred on the world origin, length on Y with the front at
--Y, width on X, height on Z.
+−Y, width on X, height on Z.
 
 Press Numpad 5 before checking anything. Reference planes never line up in
 perspective view, and that alone accounts for a good share of "my blueprint is
