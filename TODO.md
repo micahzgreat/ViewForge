@@ -15,7 +15,5 @@
 
 ## 💡 Ideas
 
-- [ ] Add option to remove watermark from images, and give choice to save a copy.
-- [ ] Add option to upscale/sharpen an image, also giving a choice to save a copy.
 - [ ] Add a preview option to preview your reference images in a 3d environment.
 - [ ] Add the ability to create a point in the preview and move it around on all 3 axis to check if they lineup.
