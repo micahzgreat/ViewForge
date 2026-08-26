@@ -9,7 +9,7 @@ pair of guides marking what a stated dimension is actually taken between.
 """
 
 from __future__ import annotations
-import json, math, os
+import json, math, os, time
 import numpy as np
 from PIL import Image
 from scipy import ndimage
@@ -67,18 +67,153 @@ class SolveError(ValueError):
 
 
 # Blueprint i/o and auto-detect
-def load_blueprint(path, threshold=None):
-    g = np.asarray(Image.open(path).convert("L")).astype(np.int16)
-    if threshold is None:
-        paper = np.percentile(g, 90)
-        threshold = int(max(60, min(240, paper - 25)))
-    return g, (g < threshold), threshold
+
+# The lightest an ink pixel may come out in an exported plane. The self-check
+# re-measures the written files by looking for pixels under 200, so tone that is
+# kept has to still read as ink there.
+INK_MAX = 199
+INK_MIN_T = 16          # never call a difference smaller than this a mark
+
+
+def read_image(path):
+    """The blueprint as HxWx3 uint8, transparency flattened onto white.
+
+    Converting an RGBA drawing straight to RGB turns every transparent pixel
+    black, which arrives as one solid ink rectangle covering the page.
+    """
+    im = Image.open(path)
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        im = Image.alpha_composite(
+            Image.new("RGBA", im.size, (255, 255, 255, 255)), im.convert("RGBA"))
+    return np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+
+def _luma(a):
+    return a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+
+def _dist_from(rgb, paper):
+    """How far each pixel is from the paper colour, in its furthest channel.
+
+    Distance, not brightness. A colour drawing's fills are not reliably dark: a
+    pale yellow panel is lighter than mid grey linework, so a brightness test
+    drops it, while a saturated red one is dark enough to pass and comes back
+    as solid black.
+    """
+    p = np.asarray(paper, dtype=np.int16).reshape(1, 1, 3)
+    return np.abs(rgb.astype(np.int16) - p).max(axis=2).astype(np.uint8)
+
+
+def _pick_threshold(dist):
+    """Above the paper's own grain, below the real marks.
+
+    The old rule was the 90th percentile of brightness minus 25, which on clean
+    white paper calls everything under 230 ink - grey watermarks, scanner
+    shading and JPEG mush included.
+
+    Most of a drawing is paper, so the 75th percentile of the distance from the
+    paper colour measures how much the paper itself wanders: nothing on a clean
+    export, a good deal on a photograph with a shadow across it. Sit above that.
+    """
+    hist = np.bincount(dist.ravel(), minlength=256).astype(float)
+    sm = np.convolve(hist, np.ones(5) / 5.0, mode="same")
+    peak = int(np.argmax(sm[:48]))
+    top = sm[peak]
+    if top <= 0:
+        return INK_MIN_T
+    # Walk out of the paper cluster until its tail has died away. Where that
+    # happens is the paper's spread, whatever share of the page it occupies -
+    # a percentile cannot do this, because a sheet with four large views on it
+    # is more than half ink and any high percentile lands inside the drawing.
+    t = INK_MIN_T
+    for i in range(peak + 1, 161):
+        if sm[i] < 0.06 * top:
+            t = i + 2
+            break
+    return int(min(max(t, INK_MIN_T), 200))
+
+
+def ink_mask(rgb, threshold=None, invert=None):
+    """(ink, info). info says what was worked out about the drawing."""
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    flat = rgb[::3, ::3].reshape(-1, 3)
+    light = np.percentile(flat, 90, axis=0)
+    dark = np.percentile(flat, 10, axis=0)
+    if invert is None:
+        d = _dist_from(rgb, light)
+        t = threshold if threshold is not None else _pick_threshold(d)
+        # A drawing is not two thirds ink. If it looks like it is, the paper is
+        # the dark side: pale linework on a dark ground.
+        invert = bool((d > t).mean() > 0.60)
+    paper = dark if invert else light
+    dist = _dist_from(rgb, paper)
+    t = int(threshold) if threshold is not None else _pick_threshold(dist)
+    ink = dist > t
+
+    s = rgb[::4, ::4].astype(np.int16)
+    m = ink[::4, ::4]
+    s = s[m] if m.any() else s.reshape(-1, 3)
+    chroma = float(np.mean(s.max(axis=1) - s.min(axis=1))) if len(s) else 0.0
+    cov = float(ink.mean())
+    inner = float(ndimage.binary_erosion(ink, np.ones((5, 5), bool)).mean())
+    return ink, dict(threshold=t, inverted=bool(invert), coverage=cov,
+                     paper=[int(round(x)) for x in paper], chroma=chroma,
+                     colour=bool(chroma > 18.0),
+                     filled=bool(cov > 0.02 and inner > 0.45 * cov))
+
+
+def load_blueprint(path, threshold=None, invert=None):
+    """(grey, ink, info) for a path, a PIL image or an RGB array."""
+    if isinstance(path, (str, bytes, os.PathLike)):
+        rgb = read_image(path)
+    elif isinstance(path, Image.Image):
+        rgb = np.asarray(path.convert("RGB"), dtype=np.uint8)
+    else:
+        rgb = np.asarray(path, dtype=np.uint8)
+    ink, info = ink_mask(rgb, threshold, invert)
+    return _luma(rgb.astype(np.float32)).astype(np.int16), ink, info
+
+
+def render_source(rgb, ink, info=None, style="auto"):
+    """(pixels, PIL mode) an exported plane is drawn from, paper lifted to white.
+
+    'line' is the old behaviour: every mark flattened to solid black. That is
+    what wrecks a drawing with colour or filled areas in it, because a red car
+    body and the outline around it are equally ink, so the view exports as one
+    black blob. 'tone' and 'colour' keep the drawing as drawn and throw away
+    only the paper.
+    """
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    if info is None:
+        inverted = bool(ink.mean() > 0.60)
+        info = dict(inverted=inverted, colour=True,
+                    paper=[int(round(x)) for x in
+                           np.percentile(rgb[::3, ::3].reshape(-1, 3),
+                                         10 if inverted else 90, axis=0)])
+    if style == "auto":
+        style = "colour" if info.get("colour") else "tone"
+    if style == "line":
+        return np.where(ink, 0, 255).astype(np.uint8), "L"
+    if style not in ("tone", "colour"):
+        raise SolveError(f"Unknown render style '{style}'. Use 'auto', "
+                         f"'colour', 'tone' or 'line'.")
+    a = rgb.astype(np.float32)
+    paper = np.asarray(info.get("paper", [255, 255, 255]), np.float32)
+    if info.get("inverted"):
+        a, paper = 255.0 - a, 255.0 - paper
+    # Paper to white, so a grey scan does not export as a grey rectangle.
+    a = np.clip(a * (255.0 / np.maximum(paper, 40.0)).reshape(1, 1, 3), 0.0, 255.0)
+    if style == "tone":
+        return (np.where(ink, np.minimum(_luma(a), INK_MAX), 255.0)
+                .astype(np.uint8), "L")
+    a = a * np.minimum(1.0, INK_MAX / np.maximum(_luma(a), 1.0))[..., None]
+    return np.where(ink[..., None], a, 255.0).astype(np.uint8), "RGB"
 
 
 def new_view(**kw):
     v = dict(cid=None, source="box", x0=0, x1=10, y0=0, y1=10,
              role="ignore", facing="left", hflip=False,
-             gauge_h=None, gauge_v=None)
+             gauge_h=None, gauge_v=None, centre_h=None, centre_v=None)
     v.update(kw)
     return v
 
@@ -240,9 +375,46 @@ def symmetry_axis(mask, box, axis):
         if d < bestd:
             best, bestd = c, d
         c += 0.5
+    # Then again, finely, around the winner. Half a pixel of resolution sounds
+    # like plenty until you notice it is the whole error budget: on a drawing
+    # scanned at seven millimetres to the pixel, half a pixel is nearly four
+    # millimetres of mirror line, which is the difference between the two
+    # halves of a model meeting and not.
+    c = best - 0.5
+    while c <= best + 0.5 + 1e-9:
+        d = score(c)
+        if d < bestd:
+            best, bestd = c, d
+        c += 0.05
     if bestd > d_mid * (1.0 - SYM_GAIN):
         best = mid
     return base + best
+
+
+def mirror_line(v, ink, lab):
+    """Where this view looks symmetric, on whichever axis carries the width.
+
+    Returns ('h', column) or ('v', row) in blueprint pixels, or None when the
+    view does not show W at all - a side view carries length and height, and
+    has no middle to find.
+    """
+    if v["role"] not in ROLE_AXES:
+        return None
+    ah, av = view_axes(v)
+    if ah == "W":
+        mask, _, _, box = view_metrics(v, ink, lab)
+        return "h", float(symmetry_axis(mask, box, 1))
+    if av == "W":
+        mask, _, _, box = view_metrics(v, ink, lab)
+        return "v", float(symmetry_axis(mask, box, 0))
+    return None
+
+
+def box_centre(v, ink, lab, key):
+    """The middle of a view's box on one axis, which is where it is centred
+    when no centre line is set."""
+    _, _, _, box = view_metrics(v, ink, lab)
+    return ((box[0] + box[1]) / 2.0 if key == "h" else (box[2] + box[3]) / 2.0)
 
 
 # Solving
@@ -308,26 +480,40 @@ def solve(views, ink, lab, dims):
         # The whole view in mm, which is what the exported plane measures.
         rec["full_h"] = sh_px * rec["mm_px_h"]
         rec["full_v"] = sv_px * rec["mm_px_v"]
-        # Every view is centred on its own box, on every axis. The box is what
-        # the stated dimension was measured against, so it is the only centre
-        # two views can be relied on to agree about.
-        rec["cen_h"] = (box[0] + box[1]) / 2
-        rec["cen_v"] = (box[2] + box[3]) / 2
-        rec["off_h"] = rec["off_v"] = 0.0
-        # The mirror line is still looked for, and still reported, but it is
-        # not applied. Each view finds it in its own ink, so views sharing the
-        # width axis used to be shifted by different amounts, in opposite
-        # directions as often as not - and two planes shifted differently is
-        # precisely what fails to line up in Blender. It is now a statement
-        # about the drawing, not a change made to it.
+        # Where the object's origin sits on this view. The middle of the box
+        # unless you have put a centre line on it.
+        #
+        # The box centre is a good guess and a bad guarantee. It is the middle
+        # of the ink, and the middle of the ink is only the middle of the
+        # object when the drawing is perfectly even - one wing mirror caught by
+        # the box, a dimension arrow, an edge drawn a little heavier, and it is
+        # not. On the width axis that matters more than anywhere else, because
+        # a mirror modifier works about X=0 and nothing else will do.
+        rec["bc_h"] = (box[0] + box[1]) / 2
+        rec["bc_v"] = (box[2] + box[3]) / 2
+        # Where the ink itself sits, which is not the middle of a hand-drawn
+        # box unless the box hugs it. The self-check measures ink, so this is
+        # what an intended offset has to be stated against.
+        iys, ixs = np.nonzero(mask)
+        rec["ic_h"] = (int(ixs.min()) + int(ixs.max())) / 2.0
+        rec["ic_v"] = (int(iys.min()) + int(iys.max())) / 2.0
+        rec["set_h"] = v.get("centre_h") is not None
+        rec["set_v"] = v.get("centre_v") is not None
+        rec["cen_h"] = float(v["centre_h"]) if rec["set_h"] else rec["bc_h"]
+        rec["cen_v"] = float(v["centre_v"]) if rec["set_v"] else rec["bc_v"]
+        rec["off_h"] = rec["off_v"] = 0.0     # filled in once the scale is known
+        # The mirror line the drawing itself suggests, measured against
+        # whatever centre is actually being used.
+        rec["sym_px"] = rec["sym_key"] = None
+        rec["sym_off"] = 0.0
         if ah == "W":
-            rec["sym_off"] = ((symmetry_axis(mask, box, 1)
-                               - rec["cen_h"]) * rec["mm_px_h"])
+            rec["sym_px"] = symmetry_axis(mask, box, 1)
+            rec["sym_key"] = "h"
+            rec["sym_off"] = (rec["sym_px"] - rec["cen_h"]) * rec["mm_px_h"]
         elif av == "W":
-            rec["sym_off"] = ((symmetry_axis(mask, box, 0)
-                               - rec["cen_v"]) * rec["mm_px_v"])
-        else:
-            rec["sym_off"] = 0.0
+            rec["sym_px"] = symmetry_axis(mask, box, 0)
+            rec["sym_key"] = "v"
+            rec["sym_off"] = (rec["sym_px"] - rec["cen_v"]) * rec["mm_px_v"]
         # A component renders from its own blob alone. Ink inside its bounds
         # that belongs to something else is not exported, and a hole or an
         # island floating free of the outline is exactly that.
@@ -355,25 +541,28 @@ def solve(views, ink, lab, dims):
                     f"view's own box. That is allowed, but check it is not a "
                     f"line left behind after the box was moved.")
 
-    # Where the mirror lines landed, and above all whether the views agree
-    # about them. Nothing was shifted, so this is a reading of the drawing.
-    sym = [r for r in report["views"] if r.get("sym_off")]
+    # The width axis, which is the one a mirror modifier cares about.
+    sym = [r for r in report["views"] if r["sym_key"]]
     for r in sym:
-        if abs(r["sym_off"]) > 0.02 * dims["W"]:
+        if abs(r["sym_off"]) > 0.01 * dims["W"]:
+            fixed = r["set_h"] if r["sym_key"] == "h" else r["set_v"]
             report["warnings"].append(
-                f"{r['role']}: its mirror line sits {abs(r['sym_off']):.1f} mm "
-                f"off the middle of its box on W. Nothing has been moved - every "
-                f"view is centred on its box. But if the view really is symmetric "
-                f"about that line, then its box is not centred on the object, and "
-                f"the box is what the measurement is taken from.")
+                f"{r['role']}: the line this view looks symmetric about sits "
+                f"{abs(r['sym_off']):.1f} mm off the centre it is being drawn "
+                f"around. Exported like this its middle is {abs(r['sym_off']):.1f} "
+                f"mm off X=0, so a mirror modifier will not line up with it. "
+                + ("Its centre line is set by hand - check you put it on the "
+                   "object's middle." if fixed else
+                   "Switch on this view's centre line and put it on the "
+                   "object's middle, or press 'Centre on the mirror line'."))
     if len(sym) > 1:
         spread = max(r["sym_off"] for r in sym) - min(r["sym_off"] for r in sym)
-        if spread > 0.02 * dims["W"]:
+        if spread > 0.01 * dims["W"]:
             report["warnings"].append(
-                f"Views disagree about where the object's mirror line is, by "
-                f"{spread:.1f} mm across W. At least one of their boxes is off "
-                f"centre on the width axis, and that view will sit off the "
-                f"others in Blender.")
+                f"Views disagree about where the object's middle is, by "
+                f"{spread:.1f} mm across W. Even centred, at least one of them "
+                f"will sit off the others in Blender. Put a centre line on each "
+                f"by hand, on the same feature.")
 
     for r in report["views"]:
         off = abs(r["anisotropy"] - 1) * 100
@@ -395,6 +584,107 @@ def solve(views, ink, lab, dims):
     return report
 
 
+
+# Project files
+PROJECT_EXT = ".vf"
+PROJECT_KIND = "viewforge-project"
+PROJECT_VERSION = 1
+
+VIEW_KEYS = ("cid", "source", "x0", "x1", "y0", "y1", "role", "facing",
+             "hflip", "gauge_h", "gauge_v", "centre_h", "centre_v")
+
+
+def project_data(blueprint, views, dims, settings, note=""):
+    """Everything needed to pick the job back up, as plain data."""
+    return {
+        "kind": PROJECT_KIND, "version": PROJECT_VERSION,
+        "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "blueprint": blueprint,
+        "views": [{k: v.get(k) for k in VIEW_KEYS if k in v} for v in views],
+        "dims": dict(dims or {}),
+        "settings": dict(settings or {}),
+        "note": note,
+    }
+
+
+def save_project(path, data):
+    """Write a .vf. The blueprint is recorded twice, absolute and relative to
+    the project file, so moving the pair to another machine still works."""
+    path = os.path.abspath(path)
+    bp = data.get("blueprint") or {}
+    if bp.get("path"):
+        full = os.path.abspath(bp["path"])
+        bp["path"] = full
+        try:
+            bp["relative"] = os.path.relpath(full, os.path.dirname(path))
+        except ValueError:                 # a different drive on Windows
+            bp["relative"] = None
+        if os.path.exists(full):
+            st = os.stat(full)
+            bp["bytes"] = int(st.st_size)
+    data["blueprint"] = bp
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def load_project(path):
+    """Read a .vf and hand back (blueprint info, views, dims, settings).
+
+    Views are rebuilt through new_view(), so a project written by an older
+    version gains whatever fields have been added since rather than arriving
+    half formed.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or data.get("kind") != PROJECT_KIND:
+        raise SolveError(
+            f"{os.path.basename(path)} is not a ViewForge project. A project "
+            f"file is the one you saved with File > Save project, and ends "
+            f"in {PROJECT_EXT}.")
+    if int(data.get("version", 0)) > PROJECT_VERSION:
+        raise SolveError(
+            f"{os.path.basename(path)} was written by a newer version of "
+            f"ViewForge (project format {data.get('version')}, this one reads "
+            f"{PROJECT_VERSION}). Update ViewForge.")
+    views = []
+    for raw in data.get("views", []):
+        v = new_view()
+        for k in VIEW_KEYS:
+            if k in raw:
+                v[k] = raw[k]
+        for k in ("x0", "x1", "y0", "y1"):
+            v[k] = int(v[k])
+        for k in ("gauge_h", "gauge_v"):
+            v[k] = [int(t) for t in v[k]] if v.get(k) else None
+        for k in ("centre_h", "centre_v"):
+            v[k] = None if v.get(k) is None else float(v[k])
+        if v["role"] not in ROLES:
+            v["role"] = "ignore"
+        views.append(v)
+    return data.get("blueprint") or {}, views, data.get("dims") or {}, \
+        data.get("settings") or {}
+
+
+def find_blueprint(bp, project_path):
+    """The blueprint a project refers to, wherever it has got to.
+
+    Beside the project file first: a project and its drawing are usually moved
+    together, and the absolute path recorded at save time is the one that goes
+    stale.
+    """
+    here = os.path.dirname(os.path.abspath(project_path))
+    tries = []
+    if bp.get("relative"):
+        tries.append(os.path.normpath(os.path.join(here, bp["relative"])))
+    if bp.get("path"):
+        tries.append(bp["path"])
+        tries.append(os.path.join(here, os.path.basename(bp["path"])))
+    for t in tries:
+        if t and os.path.exists(t):
+            return t, [t for t in dict.fromkeys(tries)]
+    return None, list(dict.fromkeys(tries))
+
 # Exporting
 def auto_px_per_mm(rep, need_h, need_v, detail=1.0, margin=MARGIN):
     """Pick the output resolution from the drawing rather than asking for it.
@@ -411,8 +701,22 @@ def auto_px_per_mm(rep, need_h, need_v, detail=1.0, margin=MARGIN):
     return max(p, 1e-6)
 
 
+def build_planes(views, ink, lab, dims, px_per_mm=None, margin=MARGIN,
+                 mode="fit", prefix="", detail="normal", proportional=False,
+                 src=None, info=None, style="auto"):
+    """Render one image per assigned view onto one shared canvas.
+
+    Returns (images, meta, rep) and writes nothing. images is {filename: PIL
+    image}; meta is the same record export() writes, without an outdir. The 3D
+    preview renders from this, so what it shows is what export() will write.
+    """
+    return _plan(views, ink, lab, dims, px_per_mm, margin, mode, prefix,
+                 detail, proportional, src, info, style)
+
+
 def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
-           mode="fit", prefix="", detail="normal", proportional=False):
+           mode="fit", prefix="", detail="normal", proportional=False,
+           src=None, info=None, style="auto"):
     """Write one PNG per assigned view onto one shared canvas.
 
     Every file shares that canvas, so all planes take the same Size and Offset
@@ -425,7 +729,29 @@ def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
 
     px_per_mm=None works the resolution out from the drawing, nudged by detail
     ('draft', 'normal', 'fine', or a multiplier). Pass a number to override.
+
+    src is the blueprint's own pixels, from read_image(). Given them, the planes
+    are drawn as the drawing was drawn - style 'colour', 'tone', or 'auto' to
+    pick between the two. Without them, or with style 'line', every mark
+    flattens to solid black, which is only right for a pure line drawing.
     """
+    images, meta, rep = build_planes(views, ink, lab, dims, px_per_mm, margin,
+                                     mode, prefix, detail, proportional, src,
+                                     info, style)
+    os.makedirs(outdir, exist_ok=True)
+    meta["outdir"] = os.path.abspath(outdir)
+    for name, im in images.items():
+        im.save(os.path.join(outdir, name))
+    with open(os.path.join(outdir, "placement.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    with open(os.path.join(outdir, "viewforge_import.py"), "w",
+              encoding="utf-8") as f:
+        f.write(blender_script(meta))
+    return meta, rep
+
+
+def _plan(views, ink, lab, dims, px_per_mm, margin, mode, prefix, detail,
+          proportional, src, info, style):
     if mode not in ("fit", "uniform"):
         raise SolveError(f"Unknown scaling mode '{mode}'. Use 'fit' or 'uniform'.")
     if isinstance(detail, str):
@@ -452,6 +778,15 @@ def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
         b = r["box"]
         r["reach_h"] = max(r["cen_h"] - b[0], b[1] - r["cen_h"]) * r["kh"]
         r["reach_v"] = max(r["cen_v"] - b[2], b[3] - r["cen_v"]) * r["kv"]
+        # How far this plane is deliberately off, in mm. off_mm is stated
+        # against the ink because that is what the self-check can measure, and
+        # taking it back out leaves pure placement error. centre_mm is stated
+        # against the box, because that is where the view would have sat had
+        # you not put a centre line on it, and is the figure worth reading.
+        r["off_h"] = (r["cen_h"] - r["ic_h"]) * r["kh"]
+        r["off_v"] = (r["cen_v"] - r["ic_v"]) * r["kv"]
+        r["ctr_h"] = (r["cen_h"] - r["bc_h"]) * r["kh"]
+        r["ctr_v"] = (r["cen_v"] - r["bc_v"]) * r["kv"]
 
     # Never smaller than nominal, or the Blender numbers stop meaning what
     # they say.
@@ -463,51 +798,79 @@ def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
     if not math.isfinite(px_per_mm) or px_per_mm <= 0:
         raise SolveError("px per mm must be a positive number.")
 
-    CW = max(2, int(round(2 * need_h * margin * px_per_mm)))
-    CH = max(2, int(round(2 * need_v * margin * px_per_mm)))
-    grew = (CW > int(round(max(L, W) * margin * px_per_mm)) + 1 or
-            CH > int(round(max(H, W) * margin * px_per_mm)) + 1)
+    CW = max(3, int(round(2 * need_h * margin * px_per_mm)))
+    CH = max(3, int(round(2 * need_v * margin * px_per_mm)))
+    # An odd canvas puts the origin in the middle of a pixel rather than on the
+    # seam between two. Either is exactly symmetric, but only one of them can
+    # be pointed at: zoom in on an odd canvas and the centre column of pixels
+    # IS X=0, which is the line a mirror modifier folds about.
+    CW += 1 - CW % 2
+    CH += 1 - CH % 2
+    grew = (CW > int(round(max(L, W) * margin * px_per_mm)) + 2 or
+            CH > int(round(max(H, W) * margin * px_per_mm)) + 2)
     if grew:
         rep["warnings"].append(
             f"Canvas grown to {round(CW/px_per_mm, 1)} x {round(CH/px_per_mm, 1)} mm "
             f"so no view is cut off. Every plane still shares it, so the Blender "
             f"numbers below remain identical across all of them.")
-    cx, cy = (CW - 1) / 2.0, (CH - 1) / 2.0
+    if src is None:
+        pix, pmode = np.where(ink, 0, 255).astype(np.uint8), "L"
+    else:
+        pix, pmode = render_source(src, ink, info, style)
+        if pix.shape[:2] != ink.shape:
+            raise SolveError(
+                "The blueprint pixels and the ink mask are different sizes. "
+                "Reload the blueprint.")
+    ih, iw = ink.shape
+    blank = 255 if pmode == "L" else (255, 255, 255)
 
-    os.makedirs(outdir, exist_ok=True)
-    written, seen = [], {}
+    written, seen, images = [], {}, {}
     for r in rep["views"]:
         v = r["_v"]
         mask, _, _, box = view_metrics(v, ink, lab)
-        img = Image.fromarray(np.where(mask, 0, 255).astype(np.uint8), "L")
-        kh, kv = r["kh"] * px_per_mm, r["kv"] * px_per_mm
-
-        if v["source"] == "component":
-            pad = 40
-            x0 = max(0, box[0] - pad); x1 = min(img.width - 1,  box[1] + pad)
-            y0 = max(0, box[2] - pad); y1 = min(img.height - 1, box[3] + pad)
-        else:
-            x0, x1, y0, y1 = box
-
-        dw, dh = round((x1 - x0 + 1) * kh), round((y1 - y0 + 1) * kv)
+        kx, ky = r["kh"] * px_per_mm, r["kv"] * px_per_mm
+        dw, dh = round(r["span_h"] * kx), round(r["span_v"] * ky)
         if dw < 2 or dh < 2:
             raise SolveError(
                 f"At {px_per_mm:.3f} px per mm the '{v['role']}' view comes out "
                 f"{max(dw,0)} x {max(dh,0)} pixels, which is not an image. "
                 f"Raise the detail setting.")
-        reg = img.crop((x0, y0, x1 + 1, y1 + 1)).resize((dw, dh), Image.LANCZOS)
+
+        # The slice of blueprint this canvas covers, in continuous source
+        # coordinates, placed so the view's centre lands on the canvas's own
+        # geometric centre. Nothing here is rounded, and that is the point:
+        # cropping to whole pixels and pasting at a whole-pixel offset leaves a
+        # perfectly symmetric object up to a pixel off its own mirror line, by
+        # a different amount in every view, because the amount depends on where
+        # the object's middle happens to fall between two pixels. Half a canvas
+        # pixel is nothing to look at and everything to a mirror modifier.
+        cs_h, cs_v = r["cen_h"] + 0.5, r["cen_v"] + 0.5
+        sl, sr = cs_h - (CW / 2.0) / kx, cs_h + (CW / 2.0) / kx
+        st, sb = cs_v - (CH / 2.0) / ky, cs_v + (CH / 2.0) / ky
+        i0, j0 = int(math.floor(sl)), int(math.floor(st))
+        i1, j1 = int(math.ceil(sr)), int(math.ceil(sb))
+
+        # Paper everywhere this view does not own, so a neighbouring view or a
+        # title block caught inside the same rectangle is not exported with it.
+        shape = (j1 - j0, i1 - i0) + ((3,) if pmode == "RGB" else ())
+        tile = np.full(shape, 255, np.uint8)
+        ax0, ay0 = max(i0, 0), max(j0, 0)
+        ax1, ay1 = min(i1, iw), min(j1, ih)
+        if ax1 > ax0 and ay1 > ay0:
+            m = mask[ay0:ay1, ax0:ax1]
+            tile[ay0 - j0:ay1 - j0, ax0 - i0:ax1 - i0] = np.where(
+                m[..., None] if pmode == "RGB" else m,
+                pix[ay0:ay1, ax0:ax1], 255)
+        canvas = Image.fromarray(tile, pmode).resize(
+            (CW, CH), Image.LANCZOS,
+            box=(sl - i0, st - j0, sr - i0, sb - j0))
         # Downscale far enough and the linework thins away to nothing. The file
         # still writes, blank, so catch it while we can still blame resolution.
-        if np.asarray(reg).min() >= 200:
+        if np.asarray(canvas.convert("L")).min() >= 200:
             raise SolveError(
                 f"At {px_per_mm:.3f} px per mm the '{v['role']}' view renders to "
                 f"{dw} x {dh} pixels and its linework disappears. Raise the "
                 f"detail setting.")
-        canvas = Image.new("L", (CW, CH), 255)
-        # PIL maps the crop's full width onto dw, so step by dw/src, not kh.
-        sh, sv = dw / (x1 - x0 + 1), dh / (y1 - y0 + 1)
-        canvas.paste(reg, (round(cx - (r["cen_h"] - x0) * sh),
-                           round(cy - (r["cen_v"] - y0) * sv)))
         if v["hflip"]:
             canvas = canvas.transpose(Image.FLIP_LEFT_RIGHT)
 
@@ -517,7 +880,7 @@ def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
         if seen[stem] > 1:
             stem = f"{stem}{seen[stem]}"
         name = f"{prefix}{stem}.png"
-        canvas.save(os.path.join(outdir, name))
+        images[name] = canvas
         # want_mm is the whole view at your scale; expect_mm is what this mode
         # should produce. Keeping both lets verify tell an export fault from
         # the drawing's own inconsistency.
@@ -526,19 +889,16 @@ def export(views, ink, lab, dims, outdir, px_per_mm=None, margin=MARGIN,
                             gauged=bool(r["gauged_h"] or r["gauged_v"]),
                             want_mm=[r["full_h"], r["full_v"]],
                             expect_mm=[r["span_h"] * r["kh"], r["span_v"] * r["kv"]],
-                            off_mm=[r["off_h"], r["off_v"]]))
+                            off_mm=[r["off_h"], r["off_v"]],
+                            centre_mm=[r["ctr_h"], r["ctr_v"]],
+                            centred=[bool(r["set_h"]), bool(r["set_v"])]))
 
     meta = dict(canvas_px=[CW, CH],
                 canvas_mm=[round(CW / px_per_mm, 2), round(CH / px_per_mm, 2)],
                 px_per_mm=px_per_mm, mode=mode, margin=margin, dims=dims,
                 detail=detail, proportional=bool(proportional),
-                outdir=os.path.abspath(outdir), files=written)
-    with open(os.path.join(outdir, "placement.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    with open(os.path.join(outdir, "viewforge_import.py"), "w",
-              encoding="utf-8") as f:
-        f.write(blender_script(meta))
-    return meta, rep
+                style=style, render=pmode, outdir=None, files=written)
+    return images, meta, rep
 
 
 # Verification
@@ -602,15 +962,14 @@ def verify(outdir, meta):
         if max(abs(dh), abs(dv)) > max(SLOP, 0.002 * max(want)):
             problems.append(f"{fn} is off centre by ({dh:+.2f}, {dv:+.2f}) mm.")
 
-        # Subtracting that offset hides a wrong mirror line, since the view
-        # lands exactly where it was told, so check the intention on its own.
+        # Taking that offset out hides a centre line put in the wrong place,
+        # since the view lands exactly where it was told. So say what was
+        # intended, separately, and let it be read.
+        ctr = f.get("centre_mm", [0.0, 0.0])
         for k, ax in ((0, ah), (1, av)):
-            if abs(off[k]) > max(SLOP, 0.02 * want[k]):
-                problems.append(
-                    f"{fn} was centred {off[k]:+.2f} mm off its bounding-box "
-                    f"midpoint on {ax}, to sit on the mirror line found in the "
-                    f"drawing. Correct only if this view really is symmetric "
-                    f"about that line - check it against the others.")
+            if f.get("centred", [False, False])[k] or abs(ctr[k]) > SLOP:
+                lines.append(f"  {fn:24s} centred {ctr[k]:+8.2f} mm off the "
+                             f"middle of its box on {ax}, on its centre line")
     lines.append(f"  worst deviation from the expected extent: {worst_dim:.2f} mm "
                  f"({worst_dim * P:.1f} canvas px)")
 
@@ -807,6 +1166,71 @@ if __name__ == "__main__":
     return SCRIPT_HEAD + body
 
 
+# Where a plane sits in space
+# Everything here is in millimetres, in the same frame the Blender script uses:
+# length on Y with the front at -Y, width on X, height on Z, origin at the
+# centre of the object.
+
+def _rot(rx, ry, rz):
+    """Blender's XYZ euler as a matrix: Rz @ Ry @ Rx, degrees in."""
+    cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
+    cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
+    cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], float)
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], float)
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], float)
+    return Rz @ Ry @ Rx
+
+
+def plane_basis(f, meta, push=0.0):
+    """How one exported plane is oriented and where it sits.
+
+    Returns a dict with the plane's centre, the world directions its image's
+    right and up run along, its normal, and its half extents in mm. An image
+    empty lies in its own XY plane with the image's right along +X and its top
+    along +Y, so those are just the first two columns of the rotation.
+
+    push moves the plane back along its own normal, which is what the export's
+    Blender script does so the planes do not fight with your model. It makes no
+    difference to anything measured: sighting down a plane's normal, a point
+    lands in the same place whatever the offset.
+    """
+    b = BLENDER.get(placement_key(f))
+    if b is None:
+        return None
+    R = _rot(*b["rot"])
+    cw, ch = meta["canvas_mm"]
+    ax = "XYZ".index(b["normal"][1])
+    centre = np.zeros(3)
+    centre[ax] = push if b["normal"][0] == "+" else -push
+    return dict(file=f["file"], role=f["role"], facing=f["facing"],
+                centre=centre, right=R[:, 0], up=R[:, 1], normal=R[:, 2],
+                half=(cw / 2.0, ch / 2.0), key=b["key"], rot=b["rot"])
+
+
+def plane_corners(basis):
+    """The plane's four corners, in image order: top left, top right, bottom
+    right, bottom left. PIL's transform wants them that way round."""
+    c, r, u = basis["centre"], basis["right"], basis["up"]
+    hw, hh = basis["half"]
+    return [c - r * hw + u * hh, c + r * hw + u * hh,
+            c + r * hw - u * hh, c - r * hw - u * hh]
+
+
+def project_onto_plane(point, basis, meta):
+    """Where a point in space lands on a plane, as a pixel in its image.
+
+    Sighted straight down the plane's normal, which is how you look at a
+    reference plane in an orthographic view - and the only way the question has
+    an answer at all.
+    """
+    d = np.asarray(point, float) - basis["centre"]
+    u = float(np.dot(d, basis["right"]))
+    v = float(np.dot(d, basis["up"]))
+    p = meta["px_per_mm"]
+    CW, CH = meta["canvas_px"]
+    return ((CW - 1) / 2.0 + u * p, (CH - 1) / 2.0 - v * p, u, v)
+
 # Blender report
 def blender_report(meta):
     CW, CH = meta["canvas_px"]
@@ -817,7 +1241,11 @@ def blender_report(meta):
     push = max(L, W, H) * 0.75 / 1000.0
     o = ["BLENDER SETUP",
          f"  canvas   {CW} x {CH} px  =  {cw_mm} x {ch_mm} mm "
-         f"at {meta['px_per_mm']:.3f} px/mm", ""]
+         f"at {meta['px_per_mm']:.3f} px/mm",
+         f"  origin   the middle pixel, column {(CW - 1) // 2} row "
+         f"{(CH - 1) // 2}. Both sides are odd on purpose, so X=0",
+         f"           is the centre of a pixel and not the seam between two.",
+         ""]
     if meta.get("proportional"):
         o += ["  PROPORTIONAL EXPORT. These millimetres are not measurements.",
               f"  The drawing's own proportions were kept and the object scaled",
